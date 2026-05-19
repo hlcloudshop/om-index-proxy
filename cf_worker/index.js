@@ -76,6 +76,53 @@ async function getToken(origin) {
 
 const markBadToken = id => { if (id) tokenPool.badIds.add(id); };
 
+// ──────────────────────────────────────────────────────────────────────────
+// URL token: app encrypts (expEpochSec | fileId) with a key derived from the
+// same INDEX_API_KEY this proxy already holds, so we can decrypt in-process
+// without a round trip back to the app. Format defined in
+// app/lib/url-token.js on the Next.js side:
+//   base64url( IV(12) | CIPHERTEXT(4 + N) | TAG(16) )
+//   plaintext = expEpochSec(4 BE) | fileId(UTF-8, N bytes)
+// ──────────────────────────────────────────────────────────────────────────
+let _tokenCryptoKey = null;
+async function getTokenCryptoKey() {
+  if (_tokenCryptoKey) return _tokenCryptoKey;
+  const material = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(INDEX_API_KEY));
+  _tokenCryptoKey = await crypto.subtle.importKey('raw', material, 'AES-GCM', false, ['decrypt']);
+  return _tokenCryptoKey;
+}
+function b64urlToBytes(s) {
+  s = s.replace(/-/g, '+').replace(/_/g, '/');
+  const pad = s.length % 4;
+  if (pad) s += '='.repeat(4 - pad);
+  const bin = atob(s);
+  const out = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
+  return out;
+}
+async function decodeFileToken(token) {
+  const raw = b64urlToBytes(token);
+  if (raw.length < 12 + 4 + 16) throw new Error('token too short');
+  const iv = raw.subarray(0, 12);
+  // Web Crypto wants ciphertext|tag concatenated for AES-GCM — which is
+  // exactly raw.subarray(12) since the app serialised them in that order.
+  const ciphertextWithTag = raw.subarray(12);
+  const key = await getTokenCryptoKey();
+  const plaintext = new Uint8Array(await crypto.subtle.decrypt({ name: 'AES-GCM', iv }, key, ciphertextWithTag));
+  if (plaintext.length < 4) throw new Error('plaintext too short');
+  const view = new DataView(plaintext.buffer, plaintext.byteOffset, plaintext.byteLength);
+  const expSec = view.getUint32(0, false);
+  if (Math.floor(Date.now() / 1000) > expSec) throw new Error('token expired');
+  return new TextDecoder().decode(plaintext.subarray(4));
+}
+// Prefer ?t= (the signed scheme). Fall back to ?id= so URLs already in the
+// wild from before the rollout keep working — drop the fallback when ready.
+async function resolveFileId(u) {
+  const t = u.searchParams.get('t');
+  if (t) return await decodeFileToken(t);
+  return u.searchParams.get('id') || null;
+}
+
 async function driveInit(origin, extra) {
   const t = await getToken(origin);
   return { tokenId: t.id, init: { method: 'GET', headers: { Authorization: `Bearer ${t.accessToken}`, Accept: '*/*', ...(extra || {}) } } };
@@ -189,9 +236,16 @@ export default {
     try {
       const u = new URL(req.url);
       origin = u.origin;
-      const id = u.searchParams.get('id');
       if (req.method === 'OPTIONS') return new Response(null, { status: 204, headers: { 'Access-Control-Allow-Origin': '*', 'Access-Control-Allow-Methods': 'GET, HEAD, OPTIONS', 'Access-Control-Allow-Headers': 'Range, Content-Type, If-Modified-Since', 'Access-Control-Max-Age': '86400' } });
       if (u.pathname === '/') return new Response('OK');
+      // Deferred until after the cheap routes (OPTIONS / health) so we don't
+      // burn an AES decrypt on every preflight.
+      let id;
+      try { id = await resolveFileId(u); }
+      catch (e) {
+        log('warn', 'proxy.token.invalid', e?.message || 'token decode failed');
+        return errorPage('Invalid or expired link.', 400);
+      }
       if (u.pathname === '/info') {
         if (!id) return jsonResponse({ error: 'Missing file id.' }, 400);
         const cache = caches.default;
